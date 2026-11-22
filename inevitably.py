@@ -18,6 +18,11 @@ from pathlib import Path
 
 from PIL import Image, ImageChops, ImageGrab, ImageStat, ImageTk
 
+if not getattr(sys, "frozen", False):
+    _script_dir = str(Path(__file__).resolve().parent)
+    if _script_dir not in sys.path:
+        sys.path.insert(0, _script_dir)
+
 from langs import detect_language, get_parser
 
 if sys.platform == "win32":
