@@ -1,12 +1,13 @@
 from .base import BaseLangParser
 from .en import EnglishParser
 from .ko import KoreanParser
+from .ru import RussianParser
 
 # Static registry keeps PyInstaller bundling automatic with no hidden-import flags.
-# To add a new language later (e.g. Russian or Japanese), add langs/ru.py and register it here.
 PARSERS: dict[str, BaseLangParser] = {
     "en": EnglishParser(),
     "ko": KoreanParser(),
+    "ru": RussianParser(),
 }
 
 
