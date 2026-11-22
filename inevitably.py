@@ -1,6 +1,5 @@
 import asyncio
 import ctypes
-import difflib
 import io
 import json
 import math
@@ -12,13 +11,14 @@ import sys
 import threading
 import time
 import tkinter as tk
-import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
 from PIL import Image, ImageChops, ImageGrab, ImageStat, ImageTk
+
+from langs import detect_language, get_parser
 
 if sys.platform == "win32":
     from ctypes import wintypes
@@ -332,7 +332,6 @@ class WindowsTrayIcon:
         user32.LoadIconW.argtypes = [wintypes.HINSTANCE, ctypes.c_void_p]
         user32.LoadIconW.restype = wintypes.HICON
 
-        # 1. Extract embedded --icon directly from the compiled .exe
         if getattr(sys, "frozen", False):
             small_icon = wintypes.HICON()
             large_icon = wintypes.HICON()
@@ -347,7 +346,6 @@ class WindowsTrayIcon:
                 if large_icon.value:
                     return int(large_icon.value), True
 
-        # 2. Load inevitably.ico or app.ico next to the script/exe if present
         ico_path = _find_local_icon()
         if ico_path:
             hicon = user32.LoadImageW(
@@ -356,7 +354,6 @@ class WindowsTrayIcon:
             if hicon:
                 return int(hicon), True
 
-        # 3. Fallback to standard Windows application icon
         fallback = user32.LoadIconW(None, ctypes.c_void_p(IDI_APPLICATION))
         return int(fallback or 0), False
 
@@ -650,217 +647,11 @@ def format_timer(seconds: float) -> str:
     return f"{s // 60}:{s % 60:02d}"
 
 
-# --- System Chat Ping Parser (ignores manual ally callouts) ---
-
-_OCR_DEBUG_NOISE_RE = re.compile(r"(?:\[OCR|enemy=|col=|ts=)", re.IGNORECASE)
-_SENDER_PAREN_RE = re.compile(r"^(.*?\))\s*(?:[:;.,'\"•·]|[^\w\s])?\s*(.*)$")
-_TS_COLON_RE = re.compile(r"^\s*(\d{1,2})\s*[:.;•·]\s*(\d{2})(?:\D|$)")
-_TS_COMPACT_RE = re.compile(r"^\s*(\d{2})(\d{2})(?:\s|$)")
-_PING_SPLIT_RE = re.compile(r"\s*(?:[-–—~=_•·]+|\bused\b|\bcast\b)\s*", re.IGNORECASE)
-_READY_OR_CD_RE = re.compile(r"(?:\bready\b|\d+\s*s\b|\d+:\d{2}|готов|준비)", re.IGNORECASE)
-_K_GLITCH_RE = re.compile(r"(?:[lI|1f]<)")
-_ULT_EXACT_TOKENS = {"r", "ult", "ultimate", "궁", "궁극기", "ульт", "ульта"}
-
-
-def _preclean_ocr(text: str) -> str:
-    s = unicodedata.normalize("NFKC", text or "")
-    s = _K_GLITCH_RE.sub("k", s)
-    return s.strip()
-
-
-def _norm_token(text: str) -> str:
-    s = _preclean_ocr(text).lower()
-    s = s.replace("|", "i").replace("l", "i").replace("1", "i")
-    return re.sub(r"[^\w]", "", s, flags=re.UNICODE)
-
-
-def _fuzzy_score(candidate: str, target: str) -> float:
-    c = _norm_token(candidate)
-    t = _norm_token(target)
-    if not c or not t:
-        return 0.0
-    if c == t:
-        return 1.0
-    if len(t) <= 3 or len(c) <= 3:
-        return 0.0
-    return difflib.SequenceMatcher(None, c, t).ratio()
-
-
-def _extract_timestamp(prefix: str) -> int | None:
-    if not prefix:
-        return None
-    head = re.sub(r"^[\s~•·.\-\[\(\"'`]+", "", prefix)
-    m_word = re.search(r"[A-Za-z\u0400-\u04ff]{2,}", head)
-    zone = head[: m_word.start()] if m_word else head[:12]
-    zone = zone.replace("이", "01")
-    zone = re.sub(r"[|lI\]\[]", "1", zone)
-    zone = re.sub(r"[Oo]", "0", zone)
-    zone = re.sub(r"\s*([:.;•·])\s*", ":", zone)
-    zone = re.sub(r"(?<=\d)\s+(?=\d)", "", zone)
-
-    m = _TS_COLON_RE.match(zone) or _TS_COMPACT_RE.match(zone)
-    if not m:
-        return None
-    mins, secs = int(m.group(1)), int(m.group(2))
-    if mins <= 99 and secs < 60:
-        return mins * 60 + secs
-    return None
-
-
-def _split_sender_and_body(text: str) -> tuple[str, str]:
-    m = _SENDER_PAREN_RE.match(text)
-    if m and m.group(2).strip():
-        return m.group(1), m.group(2).strip()
-
-    rcolon = text.rfind(":")
-    if rcolon >= 4:
-        return text[:rcolon], text[rcolon + 1:].strip()
-
-    return "", text.strip()
-
-
-def _match_enemy(left_clean: str, enemies: list[dict], require_same_word_count: bool) -> tuple[dict | None, float]:
-    left_words = [w for w in re.split(r"\s+", left_clean) if w]
-    best_enemy = None
-    best_score = 0.0
-    for enemy in enemies:
-        candidates = [enemy.get("champ_display", ""), enemy.get("champ_id", "")]
-        for cand in candidates:
-            if not cand:
-                continue
-            if require_same_word_count:
-                cand_words = [w for w in re.split(r"\s+", cand) if w]
-                if len(left_words) != len(cand_words):
-                    continue
-            score = _fuzzy_score(left_clean, cand)
-            if score > best_score:
-                best_score = score
-                best_enemy = enemy
-    return best_enemy, best_score
-
-
-def _spell_targets_for_enemy(enemy: dict, ult_names: dict[str, str]) -> list[tuple[int, str]]:
-    targets: list[tuple[int, str]] = []
-    for slot in (0, 1):
-        sp = enemy["spells"][slot]
-        for t in (sp.get("display_name", ""), sp.get("en_name", "")):
-            if t:
-                targets.append((slot, t))
-        if sp.get("key") == "SummonerTeleport":
-            targets.append((slot, "Unleashed Teleport"))
-    for tok in _ULT_EXACT_TOKENS:
-        targets.append((2, tok))
-    uname = ult_names.get(enemy["champ_id"], "")
-    if uname:
-        targets.append((2, uname))
-    return targets
-
-
-def _match_spell_for_enemy(right_clean: str, enemy: dict, ult_names: dict[str, str]) -> tuple[int | None, float]:
-    best_col: int | None = None
-    best_score = 0.0
-    rn = _norm_token(right_clean)
-
-    for col, target in _spell_targets_for_enemy(enemy, ult_names):
-        if col == 2 and target in _ULT_EXACT_TOKENS:
-            score = 1.0 if rn == _norm_token(target) else 0.0
-        else:
-            score = _fuzzy_score(right_clean, target)
-        if score > best_score:
-            best_score = score
-            best_col = col
-    return best_col, best_score
-
-
-def _preprocess_ocr_lines(raw_lines: list[str]) -> list[str]:
-    merged: list[str] = []
-    i = 0
-    while i < len(raw_lines):
-        cur = raw_lines[i].strip()
-        if not cur:
-            i += 1
-            continue
-        if (
-            i + 1 < len(raw_lines)
-            and re.search(r"\)\s*[:;.]?\s*$", cur)
-            and ")" not in raw_lines[i + 1]
-            and not _TS_COLON_RE.match(raw_lines[i + 1])
-        ):
-            nxt = raw_lines[i + 1].strip()
-            if nxt:
-                merged.append(f"{cur} {nxt}")
-                i += 2
-                continue
-        merged.append(cur)
-        i += 1
-    return merged
-
-
-def parse_system_ping_line(line: str, enemies: list[dict], ult_names: dict[str, str]) -> tuple[str, int, int | None] | None:
-    raw = (line or "").strip()
-    if len(raw) < 4 or _OCR_DEBUG_NOISE_RE.search(raw):
-        return None
-
-    text = _preclean_ocr(raw)
-    sender_part, body = _split_sender_and_body(text)
-    if not body:
-        return None
-
-    msg_ts = _extract_timestamp(sender_part) if sender_part else _extract_timestamp(text)
-
-    if _READY_OR_CD_RE.search(body):
-        return None
-
-    body_clean = re.sub(r"[\s.,;:'\"`~•·\-–—_]+$", "", body).strip()
-    if not body_clean:
-        return None
-
-    # Pattern 1: Explicit separator ('Malphite used Flash', 'Nami - Flash')
-    parts = _PING_SPLIT_RE.split(body_clean, maxsplit=1)
-    if len(parts) == 2:
-        left_clean = re.sub(r"\([^)]*\)", "", parts[0]).strip()
-        right_clean = re.split(r"[-–—|]", parts[1], maxsplit=1)[0].strip()
-        right_clean = re.sub(r"[\s.,;:'\"`~•·]+$", "", right_clean)
-        if left_clean and right_clean:
-            enemy, c_score = _match_enemy(left_clean, enemies, require_same_word_count=False)
-            if enemy is not None and c_score >= 0.78:
-                col, s_score = _match_spell_for_enemy(right_clean, enemy, ult_names)
-                if col is not None and s_score >= 0.78:
-                    return enemy["id"], col, msg_ts
-
-    # Pattern 2: Direct scoreboard ping without separator ('Gragas Flash', 'Ziggs Teleport', 'Renata Glasc Heal')
-    words = [w for w in re.split(r"\s+", body_clean) if w]
-    if len(words) >= 2:
-        best_hit: tuple[str, int, float] | None = None
-        for enemy in enemies:
-            for col, target in _spell_targets_for_enemy(enemy, ult_names):
-                t_words = [w for w in re.split(r"\s+", target) if w]
-                k = len(t_words)
-                if k == 0 or len(words) <= k:
-                    continue
-                left_str = " ".join(words[:-k])
-                right_str = " ".join(words[-k:])
-                if col == 2 and target in _ULT_EXACT_TOKENS:
-                    s_score = 1.0 if _norm_token(right_str) == _norm_token(target) else 0.0
-                else:
-                    s_score = _fuzzy_score(right_str, target)
-                if s_score < 0.80:
-                    continue
-                matched_enemy, c_score = _match_enemy(left_str, [enemy], require_same_word_count=True)
-                if matched_enemy is not None and c_score >= 0.80:
-                    combined = c_score + s_score
-                    if best_hit is None or combined > best_hit[2]:
-                        best_hit = (enemy["id"], col, combined)
-        if best_hit is not None:
-            return best_hit[0], best_hit[1], msg_ts
-
-    return None
-
-
 class ChatOcrWatcher:
     """
     Lightweight background watcher that captures only the chat-box region while League is
-    in the foreground, gates OCR behind a fast thumbnail pixel-diff check, and runs Windows OCR.
+    in the foreground, gates OCR behind a fast thumbnail pixel-diff check, runs Windows OCR,
+    and delegates parsing to the active language module in `langs/`.
     """
 
     def __init__(
@@ -885,7 +676,7 @@ class ChatOcrWatcher:
         self._thread: threading.Thread | None = None
         self._prev_thumb: Image.Image | None = None
         self._engine = None
-        self._engine_script = ""
+        self._engine_lang = ""
 
     @property
     def available(self) -> bool:
@@ -915,22 +706,8 @@ class ChatOcrWatcher:
             return int(sw * x0), int(sh * y0), int(sw * x1), int(sh * y1)
         return int(x0), int(y0), int(x1), int(y1)
 
-    @staticmethod
-    def _detect_script(enemies: list[dict]) -> str:
-        sample = "".join(e.get("champ_display", "") for e in enemies)
-        if any("\uac00" <= ch <= "\ud7a3" for ch in sample):
-            return "ko"
-        if any("\u0400" <= ch <= "\u04ff" for ch in sample):
-            return "ru"
-        if any("\u3040" <= ch <= "\u30ff" for ch in sample):
-            return "ja"
-        if any("\u4e00" <= ch <= "\u9fff" for ch in sample):
-            return "zh"
-        return "en"
-
-    def _ensure_engine(self, enemies: list[dict]):
-        script = self._detect_script(enemies)
-        if self._engine is not None and (self._ocr_lang or script == self._engine_script):
+    def _ensure_engine(self, lang_code: str, preferred_tags: tuple[str, ...]):
+        if self._engine is not None and (self._ocr_lang or lang_code == self._engine_lang):
             return self._engine
 
         avail_tags: list[str] = []
@@ -943,13 +720,9 @@ class ChatOcrWatcher:
                 print(f"[OCR] Could not enumerate OCR languages: {exc}")
 
         engine = None
-        preferred_tags: list[str] = []
-        if self._ocr_lang:
-            preferred_tags.append(self._ocr_lang)
-        elif script == "en":
-            preferred_tags.extend(["en-US", "en-GB"])
+        tags_to_try: list[str] = [self._ocr_lang] if self._ocr_lang else list(preferred_tags)
 
-        for tag in preferred_tags:
+        for tag in tags_to_try:
             try:
                 lang = WinRTLanguage(tag)
                 if OcrEngine.is_language_supported(lang):
@@ -962,7 +735,7 @@ class ChatOcrWatcher:
         if engine is None:
             for avail in avail_langs:
                 tag = (avail.language_tag or "").lower()
-                if tag == script or tag.startswith(f"{script}-"):
+                if tag == lang_code or tag.startswith(f"{lang_code}-"):
                     try:
                         engine = OcrEngine.try_create_from_language(avail)
                         if engine is not None:
@@ -977,12 +750,12 @@ class ChatOcrWatcher:
                 engine = None
 
         self._engine = engine
-        self._engine_script = script
+        self._engine_lang = lang_code
         if self._debug:
             chosen = engine.recognizer_language.language_tag if engine else "None"
-            print(f"[OCR] Installed languages: {avail_tags} | Desired script: {script} | Using: {chosen}")
-            if script == "en" and chosen and not chosen.lower().startswith("en"):
-                print("[OCR] TIP: Install Windows English (US) OCR language pack for much higher accuracy.")
+            print(f"[OCR] Installed languages: {avail_tags} | Parser: {lang_code} | Using: {chosen}")
+            if chosen and not chosen.lower().startswith(lang_code):
+                print(f"[OCR] TIP: Install Windows '{lang_code}' OCR language pack for higher accuracy.")
         return engine
 
     @staticmethod
@@ -1014,7 +787,9 @@ class ChatOcrWatcher:
                     time.sleep(OCR_POLL_INTERVAL_SEC)
                     continue
 
-                engine = self._ensure_engine(state["enemies"])
+                lang_code = detect_language(state["enemies"])
+                parser = get_parser(lang_code)
+                engine = self._ensure_engine(lang_code, parser.preferred_ocr_tags)
                 if engine is None:
                     time.sleep(3.0)
                     continue
@@ -1047,10 +822,10 @@ class ChatOcrWatcher:
                     continue
 
                 ult_names = self._get_ult_names()
-                for ln in _preprocess_ocr_lines(raw_lines):
+                for ln in parser.preprocess_lines(raw_lines):
                     if self._debug:
                         print(f"[OCR line] {ln}")
-                    hit = parse_system_ping_line(ln, state["enemies"], ult_names)
+                    hit = parser.parse_line(ln, state["enemies"], ult_names)
                     if hit is not None:
                         if self._debug:
                             print(f"[OCR MATCH] enemy={hit[0]} col={hit[1]} ts={hit[2]}")
