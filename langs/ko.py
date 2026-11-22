@@ -4,13 +4,21 @@ import unicodedata
 
 from .base import BaseLangParser, norm_latin_token, preclean_ocr, trim_trailing_noise
 
-_KO_NIMI_SPLIT_RE = re.compile(r"[\s.,;:'\"`~•·\-–—_]*님\s*이[\s.,;:'\"`~•·\-–—_]*")
-_KO_SAYONG_TAIL_RE = re.compile(r"\s*사\s*[용횽응웅]\S?\s*$")
+_KO_NIMI_SPLIT_RE = re.compile(
+    r"[\s.,;:'\"`~•·\-–—_“”]*님\s*(?:[이의][\s.,;:'\"`~•·\-–—_“”]*|[\s.,;:'\"`~•·\-–—_“”]+)"
+)
+_KO_SAYONG_TAIL_RE = re.compile(
+    r"(?:[\s』」\])]+(?:사\S*|[A-Za-z0-9]{1,3}용\S*).*$|[\s』」\])]*사\s*[용횽응웅요공구듣를수亏올훌~。]\S*.*$)"
+)
 _DASH_SPLIT_RE = re.compile(r"\s*[-–—~=_•·]+\s*")
 
 
 def _has_hangul(text: str) -> bool:
     return any("\uac00" <= ch <= "\ud7a3" for ch in text)
+
+
+def _is_pure_hangul(text: str) -> bool:
+    return bool(text) and all("\uac00" <= ch <= "\ud7a3" for ch in text)
 
 
 def _to_jamo_norm(text: str) -> str:
@@ -31,10 +39,17 @@ class KoreanParser(BaseLangParser):
 
     def fuzzy_score(self, candidate: str, target: str) -> float:
         if _has_hangul(target) or _has_hangul(candidate):
-            c_raw = re.sub(r"[^\uac00-\ud7a3A-Za-z0-9]", "", preclean_ocr(candidate)).lower()
             t_raw = re.sub(r"[^\uac00-\ud7a3A-Za-z0-9]", "", preclean_ocr(target)).lower()
+            c_raw = re.sub(r"[^\uac00-\ud7a3A-Za-z0-9]", "", preclean_ocr(candidate)).lower()
             if not c_raw or not t_raw:
                 return 0.0
+
+            # Strip 1-2 stray Latin/digit OCR artifacts on pure-Hangul targets (e.g. '가런l' -> '가런')
+            if _is_pure_hangul(t_raw):
+                c_ko = re.sub(r"[^\uac00-\ud7a3]", "", c_raw)
+                if c_ko and (len(c_raw) - len(c_ko)) <= 2 and len(c_ko) >= len(t_raw) - 1:
+                    c_raw = c_ko
+
             if c_raw == t_raw:
                 return 1.0
             c = _to_jamo_norm(c_raw)
@@ -43,6 +58,12 @@ class KoreanParser(BaseLangParser):
                 return 0.0
             if c == t:
                 return 1.0
+
+            # Allow 1-jamo OCR typo on 2-syllable no-받침 champion names (티모->리모, 나미, 아리, etc.)
+            if len(c_raw) == 2 and len(t_raw) == 2 and len(c) == 4 and len(t) == 4:
+                ratio = difflib.SequenceMatcher(None, c, t).ratio()
+                return 0.80 if ratio >= 0.75 else 0.0
+
             if len(t) < 5 or len(c) < 5:
                 return 0.0
             return difflib.SequenceMatcher(None, c, t).ratio()
@@ -97,8 +118,15 @@ class KoreanParser(BaseLangParser):
                 for cand_champ in champ_cands:
                     lc = len(cand_champ)
                     max_len_diff = 1 if lc >= 4 else 0
+                    pure_ko_champ = _is_pure_hangul(cand_champ)
                     for pv in prefix_variants:
-                        if not pv or abs(len(pv) - lc) > max_len_diff:
+                        if not pv:
+                            continue
+                        if pure_ko_champ:
+                            pv_ko = re.sub(r"[^\uac00-\ud7a3]", "", pv)
+                            if pv_ko and (len(pv) - len(pv_ko)) <= 2:
+                                pv = pv_ko
+                        if abs(len(pv) - lc) > max_len_diff:
                             continue
                         c_score = self.fuzzy_score(pv, cand_champ)
                         if c_score >= 0.78:
@@ -116,7 +144,7 @@ class KoreanParser(BaseLangParser):
         enemies: list[dict],
         ult_names: dict[str, str],
     ) -> tuple[str, int] | None:
-        # Pattern 1: '<Champion> 님이 <Spell> 사용'
+        # Pattern 1: '<Champion> 님이/님의/님 <Spell> 사용'
         ko_parts = _KO_NIMI_SPLIT_RE.split(body_clean, maxsplit=1)
         if len(ko_parts) == 2:
             left_clean = re.sub(r"\([^)]*\)", "", ko_parts[0]).strip()
@@ -129,7 +157,7 @@ class KoreanParser(BaseLangParser):
                     if col is not None and s_score >= 0.78:
                         return enemy["id"], col
 
-        # Pattern 1b: Garbled '님이' (e.g. '럼블 횹이 점화 사용') when ending in '사용'
+        # Pattern 1b: Garbled '님이' (e.g. '베이가뇜이 점멸 사~') when ending in a '사용' tail
         m_sayong = _KO_SAYONG_TAIL_RE.search(body_clean)
         if m_sayong:
             inner = body_clean[: m_sayong.start()].strip()
@@ -149,5 +177,5 @@ class KoreanParser(BaseLangParser):
                     if col is not None and s_score >= 0.78:
                         return enemy["id"], col
 
-        # Pattern 3: Direct scoreboard ping ('오공 강타', '트린 다미어 점멸', '트린다미어점화')
+        # Pattern 3: Direct scoreboard ping ('오공 강타', '트린 다미어 점멸', '가런l 점화', '리모 점멸')
         return self._match_compact(body_clean, enemies, ult_names, allow_honorific_suffix=False)

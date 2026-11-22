@@ -7,8 +7,10 @@ _SENDER_PAREN_RE = re.compile(r"^(.*?\))\s*(?:[:;.,'\"•·]|[^\w\s])?\s*(.*)$")
 _TS_COLON_RE = re.compile(r"^\s*(\d{1,2})\s*[:.;•·]\s*(\d{2})(?:\D|$)")
 _TS_FIVE_DIGIT_RE = re.compile(r"^\s*(\d{2})1(\d{2})(?:\D|$)")
 _TS_COMPACT_RE = re.compile(r"^\s*(\d{2})(\d{2})(?:\s|$)")
+_TS_SWALLOWED_ZERO_RE = re.compile(r"^\s*(\d{2})\s*羽\s*(\d)(?:\D|$)")
+_TS_NOISY_SEP_RE = re.compile(r"^\s*(\d{2})\s*[^\d\s]{1,2}\s*(\d{2})(?:\D|$)")
 _K_GLITCH_RE = re.compile(r"(?:[lI|1f]<)")
-_TRAILING_NOISE_RE = re.compile(r"[\s.,;:'\"`~•·\-–—_/?*!|]+$")
+_TRAILING_NOISE_RE = re.compile(r"[\s.,;:'\"`~•·\-–—_/?*!|“”]+$")
 
 
 def preclean_ocr(text: str) -> str:
@@ -28,7 +30,7 @@ def extract_timestamp(prefix: str) -> int | None:
     """Recover [MM:SS] from the start of a chat sender prefix even with OCR digit glitches."""
     if not prefix:
         return None
-    head = re.sub(r"^[\s~•·.\-\[\(\"'`]+", "", prefix)
+    head = re.sub(r"^[\s~•·.\-\[\(\"'`“”]+", "", prefix)
     if head.startswith("이") and len(head) >= 2 and head[1] in ":.;•· 0123456789|lI":
         head = "01" + head[1:]
     m_word = re.search(r"[A-Za-z\u0400-\u04ff\uac00-\ud7a3]{2,}", head)
@@ -38,7 +40,13 @@ def extract_timestamp(prefix: str) -> int | None:
     zone = re.sub(r"\s*([:.;•·])\s*", ":", zone)
     zone = re.sub(r"(?<=\d)\s+(?=\d)", "", zone)
 
-    m = _TS_COLON_RE.match(zone) or _TS_FIVE_DIGIT_RE.match(zone) or _TS_COMPACT_RE.match(zone)
+    m = (
+        _TS_COLON_RE.match(zone)
+        or _TS_FIVE_DIGIT_RE.match(zone)
+        or _TS_COMPACT_RE.match(zone)
+        or _TS_SWALLOWED_ZERO_RE.match(zone)
+        or _TS_NOISY_SEP_RE.match(zone)
+    )
     if not m:
         return None
     mins, secs = int(m.group(1)), int(m.group(2))
